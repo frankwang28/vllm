@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     VLLM_USAGE_STATS_SERVER: str = "https://stats.vllm.ai"
     VLLM_NO_USAGE_STATS: bool = False
     VLLM_DISABLE_FLASHINFER_PREFILL: bool = False
+    VLLM_FLASHINFER_PREFILL_FIXED_SPLIT_SIZE: int = 4096
     VLLM_DO_NOT_TRACK: bool = False
     VLLM_USAGE_SOURCE: str = ""
     VLLM_CONFIGURE_LOGGING: bool = True
@@ -642,6 +643,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_DISABLE_FLASHINFER_PREFILL", "0"
     )
     == "1",
+    "VLLM_FLASHINFER_PREFILL_FIXED_SPLIT_SIZE": lambda: maybe_convert_int(
+        os.getenv("VLLM_FLASHINFER_PREFILL_FIXED_SPLIT_SIZE")
+    ),
     "VLLM_DO_NOT_TRACK": lambda: (
         os.environ.get("VLLM_DO_NOT_TRACK", None)
         or os.environ.get("DO_NOT_TRACK", None)

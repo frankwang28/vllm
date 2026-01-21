@@ -505,6 +505,19 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.decode_fixed_split_size = 2048
             self.prefill_fixed_split_size = 4096
             self.disable_split_kv = True
+            prefill_fixed_split_size = (
+                envs.VLLM_FLASHINFER_PREFILL_FIXED_SPLIT_SIZE
+            )
+            if prefill_fixed_split_size is not None:
+                if prefill_fixed_split_size <= 0:
+                    logger.warning_once(
+                        "Ignoring VLLM_FLASHINFER_PREFILL_FIXED_SPLIT_SIZE=%s; "
+                        "value must be > 0.",
+                        prefill_fixed_split_size,
+                        scope="local",
+                    )
+                else:
+                    self.prefill_fixed_split_size = prefill_fixed_split_size
         else:
             self.decode_fixed_split_size = -1
             self.prefill_fixed_split_size = -1

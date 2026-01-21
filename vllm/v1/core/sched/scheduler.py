@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsReader,
 )
@@ -58,6 +59,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 logger = init_logger(__name__)
 
@@ -89,6 +91,15 @@ class Scheduler(SchedulerInterface):
             )
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
+        self.flashinfer_prefill_fixed_split_size: int | None = None
+        if vllm_is_batch_invariant():
+            backend = vllm_config.attention_config.backend
+            if backend == AttentionBackendEnum.FLASHINFER:
+                split_size = envs.VLLM_FLASHINFER_PREFILL_FIXED_SPLIT_SIZE
+                if split_size is None:
+                    split_size = 4096
+                if split_size is not None and split_size > 0:
+                    self.flashinfer_prefill_fixed_split_size = int(split_size)
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -570,7 +581,7 @@ class Scheduler(SchedulerInterface):
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
-                    num_new_tokens = request.num_tokens - num_computed_tokens
+                    num_new_tokens = remaining_tokens = request.num_tokens - num_computed_tokens
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
@@ -605,6 +616,28 @@ class Scheduler(SchedulerInterface):
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
                             break
+
+                    # For FlashInfer in batch-invariant mode, ensure chunked
+                    # prefill sizes are multiples of the fixed split size.
+                    # This avoids sub-split prefill chunks that can introduce
+                    # nondeterminism in FlashInfer's prefill kernels.
+                    if (
+                        self.flashinfer_prefill_fixed_split_size is not None
+                        and num_computed_tokens < request.num_prompt_tokens
+                    ):
+                        if (
+                            remaining_tokens > num_new_tokens
+                            and num_new_tokens
+                            < self.flashinfer_prefill_fixed_split_size
+                        ):
+                            break
+                        if (
+                            remaining_tokens > num_new_tokens >= self.flashinfer_prefill_fixed_split_size
+                        ):
+                            split_size = self.flashinfer_prefill_fixed_split_size
+                            num_new_tokens = (
+                                num_new_tokens // split_size
+                            ) * split_size
 
                 # Handles an edge case when P/D Disaggregation
                 # is used with Spec Decoding where an

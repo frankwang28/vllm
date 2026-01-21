@@ -320,12 +320,12 @@ def test_logprobs_bitwise_batch_invariance_bs1_vs_bsN(
             if not torch.equal(a, b):
                 max_diff = torch.abs(a - b).max().item()
                 # Print which token failed
-                print(f"\n[DIVERGENCE] Prompt {i}, Token {t}: max_diff={max_diff:.6e}")
+                # print(f"\n[DIVERGENCE] Prompt {i}, Token {t}: max_diff={max_diff:.6e}")
                 bs1_tok = tokens_bs1[t] if t < len(tokens_bs1) else "N/A"
                 bsN_tok = tokens_bsN[t] if t < len(tokens_bsN) else "N/A"
-                print(f"  Token IDs: bs1={bs1_tok}, bsN={bsN_tok}")
-                print(f"  BS=1 logprob: {a.tolist()}")
-                print(f"  BS=N logprob: {b.tolist()}")
+                # print(f"  Token IDs: bs1={bs1_tok}, bsN={bsN_tok}")
+                # print(f"  BS=1 logprob: {a.tolist()}")
+                # print(f"  BS=N logprob: {b.tolist()}")
                 failed_prompts.append(
                     {
                         "prompt_idx": i,
@@ -356,21 +356,21 @@ def test_logprobs_bitwise_batch_invariance_bs1_vs_bsN(
         for fail in failed_prompts:
             print(f"\nPrompt {fail['prompt_idx']} (step {fail['step']}):")
             print(f"  Reason: {fail['reason']}")
-            print(f"  Preview: {fail['prompt_preview']}...")
-
-            # Always show the tokens
-            if "bs1_tokens" in fail:
-                print(f"  BS=1 tokens: {fail['bs1_tokens']}")
-            if "bsN_tokens" in fail:
-                print(f"  BS=N tokens: {fail['bsN_tokens']}")
-
-            if "bs1_all_logprobs" in fail:
-                print(f"  BS=1 logprobs for all {len(fail['bs1_all_logprobs'])} steps:")
-                for step_idx, logprobs in enumerate(fail["bs1_all_logprobs"]):
-                    print(f"    Step {step_idx}: {logprobs}")
-                print(f"  BS=N logprobs for all {len(fail['bsN_all_logprobs'])} steps:")
-                for step_idx, logprobs in enumerate(fail["bsN_all_logprobs"]):
-                    print(f"    Step {step_idx}: {logprobs}")
+            # print(f"  Preview: {fail['prompt_preview']}...")
+            #
+            # # Always show the tokens
+            # if "bs1_tokens" in fail:
+            #     print(f"  BS=1 tokens: {fail['bs1_tokens']}")
+            # if "bsN_tokens" in fail:
+            #     print(f"  BS=N tokens: {fail['bsN_tokens']}")
+            #
+            # if "bs1_all_logprobs" in fail:
+            #     print(f"  BS=1 logprobs for all {len(fail['bs1_all_logprobs'])} steps:")
+            #     for step_idx, logprobs in enumerate(fail["bs1_all_logprobs"]):
+            #         print(f"    Step {step_idx}: {logprobs}")
+            #     print(f"  BS=N logprobs for all {len(fail['bsN_all_logprobs'])} steps:")
+            #     for step_idx, logprobs in enumerate(fail["bsN_all_logprobs"]):
+            #         print(f"    Step {step_idx}: {logprobs}")
         print(f"{'=' * 80}\n")
 
         # Fail the test with summary
@@ -513,7 +513,7 @@ def test_logprobs_without_batch_invariance_should_fail(
             )
         bs1_logprobs_per_prompt.append(step_logprobs)
         bs1_tokens_per_prompt.append(token_ids)
-        print(f"[BS=1] Prompt {idx} generated tokens: {token_ids}")
+        # print(f"[BS=1] Prompt {idx} generated tokens: {token_ids}")
 
     # BS=N: run prompts in a batch and collect logprobs per step for each prompt.
     print("\n" + "=" * 80)
