@@ -27,6 +27,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.model_executor.layers.batch_invariant import (
+    get_batch_invariant_mla_partial_prefill_config,
+    vllm_is_batch_invariant,
+)
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsReader,
 )
@@ -105,6 +109,43 @@ class Scheduler(SchedulerInterface):
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
         )
+        self.batch_invariant_mla_partial_prefill_chunk_size: int | None = None
+        self.batch_invariant_mla_max_num_prefills_with_context: int | None = None
+        if (
+            vllm_is_batch_invariant()
+            and self.scheduler_config.enable_chunked_prefill
+            and self.vllm_config.model_config.use_mla
+        ):
+            # Batch invariant MLA: use fixed chunking so split boundaries
+            # are independent of the current batch composition.
+            (
+                self.batch_invariant_mla_partial_prefill_chunk_size,
+                self.batch_invariant_mla_max_num_prefills_with_context,
+            ) = get_batch_invariant_mla_partial_prefill_config(self.vllm_config)
+            chunk_override = envs.VLLM_BATCH_INVARIANT_MLA_PARTIAL_PREFILL_CHUNK_SIZE
+            if chunk_override != self.batch_invariant_mla_partial_prefill_chunk_size:
+                logger.info_once(
+                    "Overridden MLA batch-invariant partial prefill chunk size: using %d "
+                    "(env=%d)",
+                    self.batch_invariant_mla_partial_prefill_chunk_size,
+                    chunk_override,
+                    scope="local",
+                )
+
+            num_prefills_with_context_override = (
+                envs.VLLM_BATCH_INVARIANT_MLA_MAX_NUM_PREFILLS_WITH_CONTEXT
+            )
+            if (
+                num_prefills_with_context_override
+                != self.batch_invariant_mla_max_num_prefills_with_context
+            ):
+                logger.info_once(
+                    "Overridden MLA batch-invariant max num prefills with context: using %d "
+                    "(env=%d)",
+                    self.batch_invariant_mla_max_num_prefills_with_context,
+                    num_prefills_with_context_override,
+                    scope="local",
+                )
 
         # Create KVConnector for the Scheduler. Note that each Worker
         # will have a corresponding KVConnector with Role=WORKER.
@@ -330,6 +371,12 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        # MLA batch-invariant: cap number of in-flight prefills with context
+        # (0 < computed < prompt) to keep chunking behavior stable.
+        batch_invariant_mla_prefills_with_context_cap = (
+            self.batch_invariant_mla_max_num_prefills_with_context
+        )
+        batch_invariant_mla_prefills_with_context_scheduled = 0
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
@@ -367,6 +414,20 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            # MLA batch-invariant: "prefill with context" means this request
+            # already has some prompt tokens computed but hasn't finished yet.
+            is_batch_invariant_mla_prefill_with_context = (
+                0 < request.num_computed_tokens < request.num_prompt_tokens
+            )
+            if (
+                self.batch_invariant_mla_max_num_prefills_with_context
+                and is_batch_invariant_mla_prefill_with_context
+                and batch_invariant_mla_prefills_with_context_scheduled
+                >= self.batch_invariant_mla_max_num_prefills_with_context
+            ):
+                req_index += 1
+                continue
+
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
@@ -374,7 +435,23 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+            # MLA batch-invariant: use a fixed chunk size for prompt tokens to
+            # avoid batch-dependent split boundaries.
+            if (
+                self.batch_invariant_mla_partial_prefill_chunk_size is not None
+                and request.num_computed_tokens < request.num_prompt_tokens
+            ):
+                desired = min(
+                    num_new_tokens, self.batch_invariant_mla_partial_prefill_chunk_size
+                )
+                # Keep deterministic chunk sizes; wait for next iter if
+                # the remaining token budget cannot fit the full chunk.
+                if desired > token_budget:
+                    num_new_tokens = 0
+                else:
+                    num_new_tokens = desired
+            else:
+                num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -484,6 +561,11 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            if (
+                self.batch_invariant_mla_max_num_prefills_with_context
+                and is_batch_invariant_mla_prefill_with_context
+            ):
+                batch_invariant_mla_prefills_with_context_scheduled += 1
             req_index += 1
 
             # Speculative decode related.
@@ -636,12 +718,25 @@ class Scheduler(SchedulerInterface):
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
+                is_batch_invariant_mla_prefill_with_context = False
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
                 else:
+                    # MLA batch-invariant: "prefill with context" means this request
+                    # already has some prompt tokens computed but hasn't finished yet.
+                    is_batch_invariant_mla_prefill_with_context = (
+                        0 < num_computed_tokens < request.num_prompt_tokens
+                    )
+                    if (
+                        batch_invariant_mla_prefills_with_context_cap
+                        and is_batch_invariant_mla_prefill_with_context
+                        and batch_invariant_mla_prefills_with_context_scheduled
+                        >= batch_invariant_mla_prefills_with_context_cap
+                    ):
+                        break
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
@@ -661,7 +756,20 @@ class Scheduler(SchedulerInterface):
                         # we can stop the scheduling here.
                         break
 
-                    num_new_tokens = min(num_new_tokens, token_budget)
+                    if self.batch_invariant_mla_partial_prefill_chunk_size:
+                        if (
+                            num_new_tokens
+                            > self.batch_invariant_mla_partial_prefill_chunk_size
+                        ):
+                            num_new_tokens = (
+                                self.batch_invariant_mla_partial_prefill_chunk_size
+                            )
+                        # Keep deterministic chunk sizes; wait for next iter if
+                        # the remaining token budget cannot fit the full chunk.
+                        if num_new_tokens > token_budget:
+                            break
+                    else:
+                        num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -769,6 +877,11 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                if (
+                    batch_invariant_mla_prefills_with_context_cap
+                    and is_batch_invariant_mla_prefill_with_context
+                ):
+                    batch_invariant_mla_prefills_with_context_scheduled += 1
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.

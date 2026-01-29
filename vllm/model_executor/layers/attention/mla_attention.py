@@ -218,7 +218,10 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
+from vllm.model_executor.layers.batch_invariant import (
+    get_batch_invariant_mla_partial_prefill_config,
+    vllm_is_batch_invariant,
+)
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
 )
@@ -1208,7 +1211,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
             chunked_context_metadata = None
             if max_context_len_cpu > 0:
-                # NOTE: it is recommend you read the `Chunked Prefill` section
+                # NOTE: it is recommended you read the `Chunked Prefill` section
                 # in the comment at the top of the file before trying to
                 # understand the following code
 
@@ -1216,8 +1219,17 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 # prefill in the batch, we could probably use a more advanced
                 # algorithm here and allocate more workspace to prefills with
                 # longer context lengths
+                num_prefills_for_chunking = num_prefills_with_context_cpu
+
+                # in batch-invariant mode, we make the allocation
+                # independent of the current batch size so chunk
+                # boundaries stay fixed when we do require chunking
+                if vllm_is_batch_invariant():
+                    _, num_prefills_for_chunking = (
+                        get_batch_invariant_mla_partial_prefill_config(self.vllm_config)
+                    )
                 max_context_chunk = (
-                    self.chunked_prefill_workspace_size // num_prefills_with_context_cpu
+                    self.chunked_prefill_workspace_size // num_prefills_for_chunking
                 )
 
                 if self.aot_schedule:

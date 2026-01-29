@@ -253,6 +253,8 @@ if TYPE_CHECKING:
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
     VLLM_LORA_DISABLE_PDL: bool = False
+    VLLM_BATCH_INVARIANT_MLA_PARTIAL_PREFILL_CHUNK_SIZE: int = 4096
+    VLLM_BATCH_INVARIANT_MLA_MAX_NUM_PREFILLS_WITH_CONTEXT: int = 0
 
 
 def get_default_cache_root():
@@ -1626,6 +1628,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disable PDL for LoRA, as enabling PDL with LoRA on SM100 causes
     # Triton compilation to fail.
     "VLLM_LORA_DISABLE_PDL": lambda: bool(int(os.getenv("VLLM_LORA_DISABLE_PDL", "0"))),
+    # Override fixed partial prefill chunk size used in MLA batch-invariant mode.
+    # If <= 0 or unset, falls back to a heuristic. We waste at most the size - 1
+    # tokens if the chunk does not fit nicely into the defined chunk size.
+    # Set this close to or at max_num_seqs for BS=1 cases for better prefill speed.
+    "VLLM_BATCH_INVARIANT_MLA_PARTIAL_PREFILL_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_BATCH_INVARIANT_MLA_PARTIAL_PREFILL_CHUNK_SIZE", "4096")
+    ),
+    # Override max number of partial prefills with context allowed per step
+    # in MLA batch-invariant mode. If <= 0 or unset, falls back to a heuristic.
+    "VLLM_BATCH_INVARIANT_MLA_MAX_NUM_PREFILLS_WITH_CONTEXT": lambda: int(
+        os.getenv("VLLM_BATCH_INVARIANT_MLA_MAX_NUM_PREFILLS_WITH_CONTEXT", "0")
+    ),
 }
 
 

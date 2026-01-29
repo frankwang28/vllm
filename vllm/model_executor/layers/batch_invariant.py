@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -13,6 +14,9 @@ from vllm.utils.torch_utils import is_torch_equal_or_newer
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 
 def _matmul_launch_metadata(
@@ -998,6 +1002,54 @@ VLLM_BATCH_INVARIANT: bool = _read_vllm_batch_invariant()
 
 def vllm_is_batch_invariant() -> bool:
     return VLLM_BATCH_INVARIANT
+
+
+def get_batch_invariant_mla_partial_prefill_config(
+    vllm_config: VllmConfig,
+) -> tuple[int, int]:
+    scheduler_config = vllm_config.scheduler_config
+    cache_config = vllm_config.cache_config
+    max_num_seqs = scheduler_config.max_num_seqs
+    max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+
+    # Fixed chunk size ensures prompt splits are independent of batch composition.
+    # If unset, default to an even split of the token budget across max_num_seqs.
+    chunk_size_override = envs.VLLM_BATCH_INVARIANT_MLA_PARTIAL_PREFILL_CHUNK_SIZE
+    if chunk_size_override > 0:
+        # Clamp to token budget to avoid scheduling a chunk larger than we can
+        # ever fit in a single iteration.
+        chunk_size = min(chunk_size_override, max_num_batched_tokens)
+    else:
+        # Heuristic: use a small effective batch size to avoid tiny chunks when
+        # max_num_seqs is large (improves long-prompt throughput in BS=1).
+        # We at most waste chunk_size - 1 tokens when a prefill chunk doesn't fit.
+        effective_seqs = min(max_num_seqs, 4)
+        chunk_size = max(1, max_num_batched_tokens // effective_seqs)
+
+    # Cap the number of prefills that already have context in a single step.
+    # If unset, derive a safe upper bound from current caching mode and chunk size.
+    num_prefills_with_context_override = (
+        envs.VLLM_BATCH_INVARIANT_MLA_MAX_NUM_PREFILLS_WITH_CONTEXT
+    )
+    if num_prefills_with_context_override > 0:
+        # Clamp to max_num_seqs as we cannot have more than that many active seqs.
+        max_num_prefills_with_context = min(
+            num_prefills_with_context_override, max_num_seqs
+        )
+    else:
+        if cache_config.enable_prefix_caching:
+            # Prefix caching can create many contextful prefills cheaply,
+            # so use the conservative upper bound. For example, we can
+            # have a lot of prompts with length x+1 with prefix caches of
+            # length x.
+            max_num_prefills_with_context = max_num_seqs
+        else:
+            # Without prefix caching, use the budget/chunk ratio as a tighter cap.
+            max_num_prefills_with_context = min(
+                max_num_seqs, max(1, max_num_batched_tokens // chunk_size)
+            )
+
+    return chunk_size, max_num_prefills_with_context
 
 
 def override_envs_for_invariance(
